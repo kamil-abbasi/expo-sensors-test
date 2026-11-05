@@ -1,5 +1,6 @@
 {
   "expo": {
+    "owner": "kamilabbasi",
     "name": "Sensors Test",
     "slug": "sensors-test",
     "version": "1.0.0",
