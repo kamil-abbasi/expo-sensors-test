@@ -13,6 +13,12 @@ Minimal Expo app that tracks distance traveled and heading using `expo-location`
 - DeviceMotion linear acceleration detects when the phone is still; while still, velocity is clamped to zero and no distance accrues (no GPS drift).
 - Distance is added only when the filtered position moves beyond its own uncertainty (min 1.5 m), so jitter doesn't inflate it.
 
+Distance comes from GPS (not dead reckoning); device motion only gates it.
+
+## Heading (`src/heading.ts`)
+
+A plain compass gives the direction of the phone's top edge, which breaks when the phone is held upright. The arrow instead uses DeviceMotion's fused orientation and projects the device vector `top - screenNormal` onto the horizontal plane: that is the top edge when flat, the back-camera direction when upright, and "in front of you" at any tilt in between. Whenever the phone is held fairly flat (< 40° tilt) and not turning fast, the offset to the regular compass (`Location.watchHeadingAsync`) is learned, and magnetic declination is applied so the arrow shows true north.
+
 ## Run
 
 This app needs a development build (it uses native sensor modules):

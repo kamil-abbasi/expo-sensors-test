@@ -4,6 +4,7 @@ import { DeviceMotion } from 'expo-sensors';
 import { useEffect, useRef, useState } from 'react';
 import { LayoutChangeEvent, Pressable, StyleSheet, Text, View } from 'react-native';
 import { cardinal, StillnessDetector, Tracker, TrackerSnapshot } from './src/tracker';
+import { HeadingFusion, motionHeading } from './src/heading';
 
 const MAX_PX_PER_METER = 8; // zoom when the user is near the start point
 const MARKER_SIZE = 64;
@@ -18,6 +19,7 @@ function niceRadius(meters: number) {
 export default function App() {
   const tracker = useRef(new Tracker()).current;
   const stillness = useRef(new StillnessDetector()).current;
+  const fusion = useRef(new HeadingFusion()).current;
 
   const [snap, setSnap] = useState<TrackerSnapshot>(tracker.snapshot());
   const [heading, setHeading] = useState<number | null>(null);
@@ -27,12 +29,21 @@ export default function App() {
 
   // Unwrapped heading so the arrow never spins the long way round 359° -> 0°.
   const rotation = useRef(0);
+  const applyHeading = (deg: number) => {
+    let delta = deg - (((rotation.current % 360) + 360) % 360);
+    if (delta > 180) delta -= 360;
+    if (delta < -180) delta += 360;
+    if (Math.abs(delta) < 0.5) return; // avoid needless re-renders
+    rotation.current += delta;
+    setHeading(rotation.current);
+  };
 
   useEffect(() => {
     let posSub: Location.LocationSubscription | undefined;
     let headSub: Location.LocationSubscription | undefined;
     let motionSub: { remove(): void } | undefined;
     let cancelled = false;
+    let motionHeadingAvailable = false;
 
     (async () => {
       const { status } = await Location.requestForegroundPermissionsAsync();
@@ -56,6 +67,15 @@ export default function App() {
           const isStill = stillness.push(linear, Date.now());
           tracker.stationary = isStill;
           setStill((prev) => (prev === isStill ? prev : isStill));
+
+          // Tilt-independent facing direction from the fused orientation.
+          const rr = m.rotationRate;
+          const rate = rr ? Math.hypot(rr.alpha, rr.beta, rr.gamma) : 0;
+          const h = m.rotation ? fusion.onMotion(motionHeading(m.rotation), rate) : null;
+          if (h !== null) {
+            motionHeadingAvailable = true;
+            applyHeading(h);
+          }
         });
       } else {
         tracker.stationary = false;
@@ -63,13 +83,11 @@ export default function App() {
       }
       if (cancelled) return;
 
+      // Plain compass: used to calibrate the motion heading while the phone is
+      // fairly flat, and as a fallback if device motion is unavailable.
       headSub = await Location.watchHeadingAsync((h) => {
-        const deg = h.trueHeading >= 0 ? h.trueHeading : h.magHeading;
-        let delta = deg - (((rotation.current % 360) + 360) % 360);
-        if (delta > 180) delta -= 360;
-        if (delta < -180) delta += 360;
-        rotation.current += delta;
-        setHeading(rotation.current);
+        fusion.onCompass(h.magHeading, h.trueHeading, h.accuracy);
+        if (!motionHeadingAvailable) applyHeading(h.trueHeading >= 0 ? h.trueHeading : h.magHeading);
       });
 
       posSub = await Location.watchPositionAsync(
@@ -100,7 +118,7 @@ export default function App() {
       headSub?.remove();
       motionSub?.remove();
     };
-  }, [tracker, stillness]);
+  }, [tracker, stillness, fusion]);
 
   const onReset = () => {
     tracker.reset();
