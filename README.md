@@ -1,19 +1,19 @@
 # Sensors Test
 
-Minimal Expo app that tracks distance traveled and heading using `expo-location` and `expo-sensors` (DeviceMotion).
+Minimal Expo app that tracks distance traveled and heading indoors with dead reckoning, using `expo-sensors` (DeviceMotion) and `expo-location` (compass).
 
 - White screen with a marker that starts in the center; the arrow points to the compass heading (north is up).
-- The marker moves in meters relative to the start point (auto zooms out to stay on screen; the ring shows scale).
+- The marker moves step by step, in meters relative to the start point (auto zooms out to stay on screen; the ring shows scale).
 - **Reset position** puts the marker back in the center and zeroes the distance.
 
-## How precision is achieved (`src/tracker.ts`)
+## Distance: pedestrian dead reckoning (`src/pdr.ts`)
 
-- GPS fixes (`Accuracy.BestForNavigation`, ~1 Hz) are projected to a local east/north plane in meters.
-- A constant-velocity Kalman filter per axis smooths fixes, weighted by each fix's reported accuracy. Fixes worse than 25 m are dropped.
-- DeviceMotion linear acceleration detects when the phone is still; while still, velocity is clamped to zero and no distance accrues (no GPS drift).
-- Distance is added only when the filtered position moves beyond its own uncertainty (min 1.5 m), so jitter doesn't inflate it.
+Built for indoor use, where GPS doesn't work. For every detected step the marker moves `stepLength` meters in the current heading.
 
-Distance comes from GPS (not dead reckoning); device motion only gates it.
+- **Steps**: vertical linear acceleration (DeviceMotion, projected on the gravity axis so phone orientation doesn't matter), low-passed at ~3 Hz; a step is an upward bounce > 1 m/s² that falls back through zero, 280 ms–2 s apart.
+- **Step length**: Weinberg model `K · (aMax − aMin)^¼`, so longer strides at faster pace. Default `K = 0.45`.
+- **Calibration**: tap *Reset position*, walk exactly 10 m, tap *Calibrate*. This scales `K` to your stride (kept until the app restarts).
+- **Heading**: gyro-integrated yaw (rotation about the vertical axis) anchored to the absolute heading below with a 20 s complementary filter, so short magnetic disturbances indoors (steel, appliances) are smoothed out.
 
 ## Heading (`src/heading.ts`)
 

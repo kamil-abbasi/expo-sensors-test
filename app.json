@@ -28,13 +28,13 @@
       [
         "expo-location",
         {
-          "locationWhenInUsePermission": "Sensors Test uses your location to measure how far you have traveled."
+          "locationWhenInUsePermission": "Sensors Test uses your location to correct the compass for true north."
         }
       ],
       [
         "expo-sensors",
         {
-          "motionPermission": "Sensors Test uses device motion to detect when you are standing still, which improves distance accuracy."
+          "motionPermission": "Sensors Test uses device motion to count your steps and track your direction."
         }
       ],
       "expo-dev-client"

@@ -1,13 +1,24 @@
 import { StatusBar } from 'expo-status-bar';
 import * as Location from 'expo-location';
+import { useKeepAwake } from 'expo-keep-awake';
 import { DeviceMotion } from 'expo-sensors';
 import { useEffect, useRef, useState } from 'react';
-import { LayoutChangeEvent, Pressable, StyleSheet, Text, View } from 'react-native';
-import { cardinal, StillnessDetector, Tracker, TrackerSnapshot } from './src/tracker';
+import { LayoutChangeEvent, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import { HeadingFusion, motionHeading } from './src/heading';
+import {
+  cardinal,
+  DeadReckoner,
+  GyroHeading,
+  PdrSnapshot,
+  StepDetector,
+  upInDevice,
+  verticalAccel,
+  yawRate,
+} from './src/pdr';
 
 const MAX_PX_PER_METER = 8; // zoom when the user is near the start point
 const MARKER_SIZE = 64;
+const CALIBRATION_DISTANCE_M = 10;
 
 /** Pick a "nice" ring radius (1, 2, 5, 10, 20, 50 ... m) for the scale circle. */
 function niceRadius(meters: number) {
@@ -17,15 +28,19 @@ function niceRadius(meters: number) {
 }
 
 export default function App() {
-  const tracker = useRef(new Tracker()).current;
-  const stillness = useRef(new StillnessDetector()).current;
-  const fusion = useRef(new HeadingFusion()).current;
+  useKeepAwake(); // sensors stop when the screen locks
 
-  const [snap, setSnap] = useState<TrackerSnapshot>(tracker.snapshot());
+  const fusion = useRef(new HeadingFusion()).current;
+  const gyro = useRef(new GyroHeading()).current;
+  const steps = useRef(new StepDetector()).current;
+  const reckoner = useRef(new DeadReckoner()).current;
+
+  const [snap, setSnap] = useState<PdrSnapshot>(reckoner.snapshot());
   const [heading, setHeading] = useState<number | null>(null);
-  const [still, setStill] = useState(true);
+  const [walking, setWalking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [area, setArea] = useState({ w: 0, h: 0 });
+  const [calibrated, setCalibrated] = useState(false);
 
   // Unwrapped heading so the arrow never spins the long way round 359° -> 0°.
   const rotation = useRef(0);
@@ -39,90 +54,81 @@ export default function App() {
   };
 
   useEffect(() => {
-    let posSub: Location.LocationSubscription | undefined;
     let headSub: Location.LocationSubscription | undefined;
     let motionSub: { remove(): void } | undefined;
     let cancelled = false;
-    let motionHeadingAvailable = false;
 
     (async () => {
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') {
-        setError('Location permission is required.');
+      if (!(await DeviceMotion.isAvailableAsync())) {
+        setError('Device motion sensors are not available on this device.');
         return;
       }
+      await DeviceMotion.requestPermissionsAsync().catch(() => undefined);
+      DeviceMotion.setUpdateInterval(20); // 50 Hz for reliable step detection
+      motionSub = DeviceMotion.addListener((m) => {
+        if (!m.rotation) return;
+        const now = Date.now();
+        const up = upInDevice(m.rotation.beta, m.rotation.gamma);
+        const rr = m.rotationRate;
 
-      // Device motion: detect whether the phone is still or being carried.
-      if (await DeviceMotion.isAvailableAsync()) {
-        await DeviceMotion.requestPermissionsAsync().catch(() => undefined);
-        DeviceMotion.setUpdateInterval(50);
-        motionSub = DeviceMotion.addListener((m) => {
-          let linear: number;
-          if (m.acceleration) {
-            linear = Math.hypot(m.acceleration.x, m.acceleration.y, m.acceleration.z);
-          } else {
-            const g = m.accelerationIncludingGravity;
-            linear = Math.abs(Math.hypot(g.x, g.y, g.z) - DeviceMotion.Gravity);
-          }
-          const isStill = stillness.push(linear, Date.now());
-          tracker.stationary = isStill;
-          setStill((prev) => (prev === isStill ? prev : isStill));
+        // Heading: tilt-compensated absolute heading, stabilised by the gyro.
+        const turnRate = rr ? Math.hypot(rr.alpha, rr.beta, rr.gamma) : 0;
+        const absolute = fusion.onMotion(motionHeading(m.rotation), turnRate);
+        const yr = rr ? yawRate(rr, up, Platform.OS) : 0;
+        const h = gyro.update(yr, absolute, now);
+        if (h !== null) applyHeading(h);
 
-          // Tilt-independent facing direction from the fused orientation.
-          const rr = m.rotationRate;
-          const rate = rr ? Math.hypot(rr.alpha, rr.beta, rr.gamma) : 0;
-          const h = m.rotation ? fusion.onMotion(motionHeading(m.rotation), rate) : null;
-          if (h !== null) {
-            motionHeadingAvailable = true;
-            applyHeading(h);
-          }
-        });
-      } else {
-        tracker.stationary = false;
-        setStill(false);
-      }
+        // Steps from vertical acceleration (works in any phone orientation).
+        let av: number;
+        if (m.acceleration) {
+          av = verticalAccel(m.acceleration, up, Platform.OS);
+        } else {
+          const g = m.accelerationIncludingGravity;
+          av = Math.hypot(g.x, g.y, g.z) - DeviceMotion.Gravity;
+        }
+        const len = steps.push(av, now);
+        if (len > 0 && h !== null) {
+          reckoner.step(len, h);
+          setSnap(reckoner.snapshot());
+        }
+        const isWalking = steps.isWalking(now);
+        setWalking((prev) => (prev === isWalking ? prev : isWalking));
+      });
       if (cancelled) return;
 
-      // Plain compass: used to calibrate the motion heading while the phone is
-      // fairly flat, and as a fallback if device motion is unavailable.
-      headSub = await Location.watchHeadingAsync((h) => {
-        fusion.onCompass(h.magHeading, h.trueHeading, h.accuracy);
-        if (!motionHeadingAvailable) applyHeading(h.trueHeading >= 0 ? h.trueHeading : h.magHeading);
+      // Compass: anchors the heading to north. Location permission lets it use
+      // true north (magnetic declination); it still works without it.
+      await Location.requestForegroundPermissionsAsync().catch(() => undefined);
+      if (cancelled) return;
+      headSub = await Location.watchHeadingAsync((hd) => {
+        fusion.onCompass(hd.magHeading, hd.trueHeading, hd.accuracy);
       });
-
-      posSub = await Location.watchPositionAsync(
-        {
-          accuracy: Location.Accuracy.BestForNavigation,
-          timeInterval: 1000,
-          distanceInterval: 0,
-          mayShowUserSettingsDialog: true,
-        },
-        (loc) => {
-          tracker.addFix({
-            latitude: loc.coords.latitude,
-            longitude: loc.coords.longitude,
-            accuracy: loc.coords.accuracy,
-            speed: loc.coords.speed,
-            timestamp: loc.timestamp,
-          });
-          setSnap(tracker.snapshot());
-        },
-        (reason) => setError(reason),
-      );
-      if (cancelled) posSub.remove();
+      if (cancelled) headSub.remove();
     })().catch((e) => setError(String(e?.message ?? e)));
 
     return () => {
       cancelled = true;
-      posSub?.remove();
       headSub?.remove();
       motionSub?.remove();
     };
-  }, [tracker, stillness, fusion]);
+  }, [fusion, gyro, steps, reckoner]);
 
   const onReset = () => {
-    tracker.reset();
-    setSnap(tracker.snapshot());
+    reckoner.reset();
+    setSnap(reckoner.snapshot());
+  };
+
+  /** Walk exactly CALIBRATION_DISTANCE_M from a reset, then tap: scales the step length. */
+  const onCalibrate = () => {
+    const s = reckoner.snapshot();
+    if (s.steps < 5) {
+      setError(`Reset, walk exactly ${CALIBRATION_DISTANCE_M} m, then tap calibrate.`);
+      return;
+    }
+    steps.k *= CALIBRATION_DISTANCE_M / s.distance;
+    setError(null);
+    setCalibrated(true);
+    onReset();
   };
 
   const onLayout = (e: LayoutChangeEvent) =>
@@ -149,13 +155,14 @@ export default function App() {
         <Text style={styles.line}>
           Heading: {headingDeg === null ? '—' : `${headingDeg}° ${cardinal(headingDeg)}`}
         </Text>
-        <Text style={styles.line}>From start: {fromStart.toFixed(1)} m</Text>
+        <Text style={styles.line}>
+          From start: {fromStart.toFixed(1)} m · {snap.steps} steps
+        </Text>
         <Text style={styles.small}>
-          {error
-            ? error
-            : snap.hasFix
-              ? `GPS ±${snap.accuracy?.toFixed(0)} m · ${still ? 'still' : 'moving'}`
-              : 'Waiting for accurate GPS fix…'}
+          {error ??
+            (heading === null
+              ? 'Starting sensors…'
+              : `Dead reckoning · ${walking ? 'walking' : 'standing'}${calibrated ? ' · calibrated' : ''}`)}
         </Text>
       </View>
 
@@ -200,12 +207,15 @@ export default function App() {
       <Pressable style={({ pressed }) => [styles.button, pressed && { opacity: 0.6 }]} onPress={onReset}>
         <Text style={styles.buttonText}>Reset position</Text>
       </Pressable>
+      <Pressable onPress={onCalibrate} hitSlop={8}>
+        <Text style={styles.link}>Calibrate: I walked {CALIBRATION_DISTANCE_M} m since reset</Text>
+      </Pressable>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#fff', paddingTop: 60, paddingBottom: 40 },
+  container: { flex: 1, backgroundColor: '#fff', paddingTop: 60, paddingBottom: 32 },
   stats: { alignItems: 'center', paddingHorizontal: 16 },
   big: { fontSize: 40, fontWeight: '700', color: '#111', fontVariant: ['tabular-nums'] },
   label: { fontSize: 13, color: '#888', marginBottom: 8 },
@@ -257,4 +267,5 @@ const styles = StyleSheet.create({
     borderRadius: 12,
   },
   buttonText: { color: '#fff', fontSize: 16, fontWeight: '600' },
+  link: { alignSelf: 'center', marginTop: 14, fontSize: 13, color: '#1a73e8' },
 });
